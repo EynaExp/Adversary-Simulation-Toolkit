@@ -1,14 +1,13 @@
 #!/bin/bash
 # ======================================================================
-#  XMRig One‑Shot Installer for Old CentOS (no systemd)
 #  Usage:   sudo ./install_xmrig.sh YOUR_WALLET [POOL_URL] [OPTIONS]
 #  Default pool: pool.supportxmr.com:443   (SSL – bypasses firewalls)
 #
 #  Options:
 #    --fix-dns   : Set public DNS (8.8.8.8) and lock /etc/resolv.conf
 #    --ip IP     : Use a direct IP instead of the domain (e.g., --ip 141.94.96.71)
+#    --worker NAME : Set a custom worker name (default: system hostname)
 #
-#  Offline fallback: put xmrig-6.26.0-linux-static-x64.tar.gz in
 #  the same folder as this script.
 # ======================================================================
 set -o pipefail
@@ -29,6 +28,7 @@ BINARY="$INSTALL_DIR/xmrig"
 WRAPPER="$INSTALL_DIR/run_xmrig.sh"
 FIX_DNS=false
 DIRECT_IP=""
+WORKER_NAME=""
 
 # ---------- Parse arguments ----------
 WALLET=""
@@ -37,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --fix-dns) FIX_DNS=true; shift ;;
         --ip) DIRECT_IP="$2"; shift 2 ;;
+        --worker) WORKER_NAME="$2"; shift 2 ;;
         *)
             if [ -z "$WALLET" ]; then
                 WALLET="$1"
@@ -48,17 +49,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[ -z "$WALLET" ] && { echo "Usage: $0 WALLET [POOL] [--fix-dns] [--ip IP]"; exit 1; }
+[ -z "$WALLET" ] && { echo "Usage: $0 WALLET [POOL] [--fix-dns] [--ip IP] [--worker NAME]"; exit 1; }
 POOL="${POOL:-$DEFAULT_POOL}"
 
 # If direct IP provided, override pool
 if [ -n "$DIRECT_IP" ]; then
-    # If IP doesn't have port, append :443
     if [[ "$DIRECT_IP" != *":"* ]]; then
         DIRECT_IP="${DIRECT_IP}:443"
     fi
     POOL="$DIRECT_IP"
     info "Using direct IP pool: $POOL"
+fi
+
+# Set worker name: use provided or fallback to hostname
+if [ -z "$WORKER_NAME" ]; then
+    WORKER_NAME=$(hostname)
+    info "No worker name provided, using system hostname: $WORKER_NAME"
+else
+    info "Using custom worker name: $WORKER_NAME"
 fi
 
 # Determine if TLS should be used (port 443 → yes)
@@ -81,12 +89,10 @@ fi
 
 # ---------- 0.5 DNS hijack detection (if pool is a domain) ----------
 if [[ "$POOL" != *":"* ]]; then
-    # no port? add default
     POOL="${POOL}:443"
 fi
-POOL_DOMAIN="${POOL%:*}"   # extract domain part (strip port)
+POOL_DOMAIN="${POOL%:*}"
 if [[ "$POOL_DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    # It's already an IP – skip DNS checks
     info "Pool is an IP address, DNS check skipped."
 else
     info "Checking DNS resolution for $POOL_DOMAIN..."
@@ -106,7 +112,6 @@ else
         echo "   → Rerun with:   --ip 141.94.96.71"
         echo "   (or any known SupportXMR IP)"
         echo "Continuing anyway, but mining will likely fail unless you fix DNS."
-        # We'll continue, the wrapper will try to connect – it will probably fail with a private IP.
     else
         ok "DNS resolution OK ($RESOLVED_IP)"
     fi
@@ -120,11 +125,10 @@ if command -v iptables &>/dev/null; then
         ok "Rule already exists."
     else
         iptables -I OUTPUT -p tcp --dport "$POOL_PORT" -j ACCEPT || err "Failed to add iptables rule"
-        # Save permanently (old CentOS)
         if [ -f /etc/sysconfig/iptables ]; then
             iptables-save > /etc/sysconfig/iptables
         elif command -v service &>/dev/null && service iptables save &>/dev/null; then
-            : # saved
+            :
         else
             info "iptables rule added but may not survive reboot – add it to your firewall script manually."
         fi
@@ -153,7 +157,6 @@ if [ ! -f "$BINARY" ]; then
     mkdir -p "$INSTALL_DIR" || err "Cannot create $INSTALL_DIR"
     cd /tmp || err "Cannot access /tmp"
 
-    # Try local file first
     if [ -f "$SCRIPT_DIR/$ARCHIVE" ]; then
         ok "Found local archive: $SCRIPT_DIR/$ARCHIVE"
         cp "$SCRIPT_DIR/$ARCHIVE" ./ || err "Failed to copy local archive"
@@ -185,22 +188,24 @@ else
     ok "XMRig already present"
 fi
 
-# ---------- 4. Create restart wrapper (unbuffered logging) ----------
+# ---------- 4. Create restart wrapper (unbuffered logging) with worker name ----------
 info "Creating wrapper script..."
 cat > "$WRAPPER" << WRAPPER_EOF
 #!/bin/bash
 BINARY="$BINARY"
 POOL="$POOL"
 WALLET="$WALLET"
+WORKER="$WORKER_NAME"
 LOG_FILE="$LOG_FILE"
 LOCK_FILE="$LOCK_FILE"
 TLS_FLAG="$TLS_FLAG"
 
-echo "\$(date): Wrapper started." >> "\$LOG_FILE"
+echo "\$(date): Wrapper started with worker name: \$WORKER" >> "\$LOG_FILE"
 while [ ! -f "\$LOCK_FILE" ]; do
     echo "\$(date): Starting XMRig..." >> "\$LOG_FILE"
     # Force unbuffered output to log file using stdbuf and tee
-    stdbuf -oL \$BINARY -o "\$POOL" -u "\$WALLET" -p x \$TLS_FLAG --randomx-no-rdmsr --donate-level=1 2>&1 | tee -a "\$LOG_FILE"
+    # -p flag sends the worker name to the pool (SupportXMR expects it in the password field)
+    stdbuf -oL \$BINARY -o "\$POOL" -u "\$WALLET" -p "\$WORKER" \$TLS_FLAG --randomx-no-rdmsr --donate-level=1 2>&1 | tee -a "\$LOG_FILE"
     EXIT_CODE=\$?
     echo "\$(date): XMRig exited with code \$EXIT_CODE. Restarting in 10s..." >> "\$LOG_FILE"
     sleep 10
@@ -220,7 +225,6 @@ if [ ! -f /etc/rc.local ]; then
 fi
 chmod +x /etc/rc.local 2>/dev/null || true
 
-# Remove any old entries
 sed -i '/run_xmrig.sh/d' /etc/rc.local
 if grep -q "^exit 0" /etc/rc.local; then
     sed -i "/^exit 0$/i nohup $WRAPPER >> $LOG_FILE 2>&1 &" /etc/rc.local
@@ -246,12 +250,13 @@ echo ""
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}   XMRig setup SUCCESSFUL${NC}"
 echo -e "${GREEN}========================================${NC}"
-echo " Wallet   : $WALLET"
-echo " Pool     : $POOL"
-echo " TLS      : ${TLS_FLAG:-off}"
-echo " Logs     : tail -f $LOG_FILE"
-echo " Stop     : touch $LOCK_FILE && pkill -f xmrig"
-echo " Status   : ps aux | grep xmrig"
+echo " Wallet     : $WALLET"
+echo " Pool       : $POOL"
+echo " TLS        : ${TLS_FLAG:-off}"
+echo " Worker name: $WORKER_NAME"
+echo " Logs       : tail -f $LOG_FILE"
+echo " Stop       : touch $LOCK_FILE && pkill -f xmrig"
+echo " Status     : ps aux | grep xmrig"
 echo ""
 echo "Wait ~1 min, then watch live output:"
 echo "  tail -f $LOG_FILE"
